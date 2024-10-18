@@ -872,7 +872,7 @@ mod batch_processor {
     use crate::{BatchingOptions, SocketType};
     use retry::{delay::jitter, delay::Exponential, retry};
     use std::sync::mpsc::Receiver;
-    use std::time::SystemTime;
+    use std::time::{Duration, SystemTime};
 
     pub(crate) enum Message {
         Data(Vec<u8>),
@@ -885,6 +885,7 @@ mod batch_processor {
         data: &Vec<u8>,
         to_addr: &String,
         socket_path: &Option<String>,
+        last_error_log: &mut SystemTime,
     ) {
         retry(
             Exponential::from_millis(batching_options.initial_retry_delay)
@@ -920,10 +921,14 @@ mod batch_processor {
             },
         )
         .unwrap_or_else(|error| {
-            println!(
-                "Failed to send within retry policy... Dropping metrics: {:?}",
-                error
-            )
+            let now = SystemTime::now();
+            if now.duration_since(*last_error_log).unwrap() >= Duration::from_secs(60) {
+                println!(
+                    "Failed to send within retry policy... Dropping metrics: {:?}",
+                    error
+                );
+                *last_error_log = now;
+            }
         });
     }
 
@@ -936,6 +941,7 @@ mod batch_processor {
     ) {
         let mut last_updated = SystemTime::now();
         let mut buffer: Vec<u8> = vec![];
+        let mut last_error_log = SystemTime::now().checked_sub(Duration::from_secs(60)).unwrap();
 
         loop {
             match rx.recv() {
@@ -955,6 +961,7 @@ mod batch_processor {
                             &buffer,
                             &to_addr,
                             &socket_path,
+                            &mut last_error_log,
                         );
                         buffer.clear();
                         last_updated = current_time;
@@ -967,6 +974,7 @@ mod batch_processor {
                         &buffer,
                         &to_addr,
                         &socket_path,
+                        &mut last_error_log,
                     );
                     buffer.clear();
                 }
