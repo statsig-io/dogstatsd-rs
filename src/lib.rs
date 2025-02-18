@@ -871,12 +871,28 @@ impl Client {
 mod batch_processor {
     use crate::{BatchingOptions, SocketType};
     use retry::{delay::jitter, delay::Exponential, retry};
+    use std::os::unix::net::UnixDatagram;
+    use std::io;
+    use std::path::Path;
     use std::sync::mpsc::Receiver;
     use std::time::{Duration, SystemTime};
 
     pub(crate) enum Message {
         Data(Vec<u8>),
         Shutdown,
+    }
+
+    fn ensure_socket_exists(socket_path: &str) -> io::Result<()> {
+        let path = Path::new(socket_path);
+    
+        if path.exists() {
+            return Ok(());
+        }
+    
+        // Create a new Unix socket (Only if it's expected that we create it)
+        let _socket = UnixDatagram::bind(path)?;
+    
+        Ok(())
     }
 
     fn send_to_socket_with_retries(
@@ -906,8 +922,14 @@ mod batch_processor {
                             let socket_path_unwrapped = socket_path
                                 .as_ref()
                                 .expect("Only invoked if socket path is defined.");
+                            // If the socket disappears, try to re-create it
+                            if error.kind() == io::ErrorKind::NotFound {
+                                ensure_socket_exists(socket_path_unwrapped)?;
+                            }
+                            // Try re-connecting to the socket
                             socket.connect(socket_path_unwrapped)?;
 
+                            // Return error such that retry will be attempted
                             return Err(error);
                         }
                     }
