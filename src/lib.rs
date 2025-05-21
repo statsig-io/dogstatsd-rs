@@ -134,6 +134,8 @@ pub struct Options {
     pub socket_path: Option<String>,
     /// OPTIONAL, if defined, will utilize batching for sending metrics
     pub batching_options: Option<BatchingOptions>,
+    /// OPTIONAL, if set, will blackhole all metrics
+    pub blackhole_metrics_to_migrate_off_datadog: Option<bool>,
 }
 
 impl Default for Options {
@@ -154,6 +156,7 @@ impl Default for Options {
     ///           default_tags: vec!(),
     ///           socket_path: None,
     ///           batching_options: None,
+    ///           blackhole_metrics_to_migrate_off_datadog: None,
     ///       },
     ///       options
     ///   )
@@ -166,6 +169,7 @@ impl Default for Options {
             default_tags: vec![],
             socket_path: None,
             batching_options: None,
+            blackhole_metrics_to_migrate_off_datadog: None,
         }
     }
 }
@@ -187,6 +191,7 @@ impl Options {
         default_tags: Vec<String>,
         socket_path: Option<String>,
         batching_options: Option<BatchingOptions>,
+        blackhole_metrics_to_migrate_off_datadog: Option<bool>,
     ) -> Self {
         Options {
             from_addr: from_addr.into(),
@@ -195,6 +200,7 @@ impl Options {
             default_tags,
             socket_path,
             batching_options,
+            blackhole_metrics_to_migrate_off_datadog,
         }
     }
 }
@@ -214,6 +220,8 @@ pub struct OptionsBuilder {
     socket_path: Option<String>,
     /// OPTIONAL, if defined, will utilize batching for sending metrics
     batching_options: Option<BatchingOptions>,
+    /// OPTIONAL, if set, will blackhole all metrics
+    blackhole_metrics_to_migrate_off_datadog: Option<bool>,
 }
 
 impl OptionsBuilder {
@@ -315,6 +323,20 @@ impl OptionsBuilder {
         self
     }
 
+    /// Will allow the builder to generate an `Options` struct with the provided value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    ///   use dogstatsd::OptionsBuilder;
+    ///
+    ///   let options_builder = OptionsBuilder::new().blackhole_metrics_to_migrate_off_datadog();
+    /// ```
+    pub fn blackhole_metrics_to_migrate_off_datadog(&mut self) -> &mut OptionsBuilder {
+        self.blackhole_metrics_to_migrate_off_datadog = Some(true);
+        self
+    }
+
     /// Will construct an `Options` with all of the provided values and fall back to the default values if they aren't provided.
     ///
     /// # Examples
@@ -349,6 +371,7 @@ impl OptionsBuilder {
             self.default_tags.to_vec(),
             self.socket_path.clone(),
             self.batching_options,
+            self.blackhole_metrics_to_migrate_off_datadog,
         )
     }
 }
@@ -414,7 +437,16 @@ impl Client {
          -> Mutex<Sender<batch_processor::Message>> {
             let (tx, rx) = mpsc::channel();
             thread::spawn(move || {
-                batch_processor::process_events(batching_options, to_addr, socket, socket_path, rx);
+                batch_processor::process_events(
+                    batching_options,
+                    to_addr,
+                    socket,
+                    socket_path,
+                    rx,
+                    options
+                        .blackhole_metrics_to_migrate_off_datadog
+                        .unwrap_or(false),
+                );
             });
             Mutex::from(tx)
         };
@@ -436,7 +468,7 @@ impl Client {
                         );
                         uds_socket = UnixDatagram::bind(socket_path.clone())?;
                     }
-                };  
+                };
                 uds_socket.set_nonblocking(true)?;
 
                 let wrapped_socket = SocketType::Uds(uds_socket);
@@ -871,8 +903,8 @@ impl Client {
 mod batch_processor {
     use crate::{BatchingOptions, SocketType};
     use retry::{delay::jitter, delay::Exponential, retry};
-    use std::os::unix::net::UnixDatagram;
     use std::io;
+    use std::os::unix::net::UnixDatagram;
     use std::path::Path;
     use std::sync::mpsc::Receiver;
     use std::time::{Duration, SystemTime};
@@ -884,14 +916,14 @@ mod batch_processor {
 
     fn ensure_socket_exists(socket_path: &str) -> io::Result<()> {
         let path = Path::new(socket_path);
-    
+
         if path.exists() {
             return Ok(());
         }
-    
+
         // Create a new Unix socket (Only if it's expected that we create it)
         let _socket = UnixDatagram::bind(path)?;
-    
+
         Ok(())
     }
 
@@ -960,10 +992,13 @@ mod batch_processor {
         socket: SocketType,
         socket_path: Option<String>,
         rx: Receiver<Message>,
+        blackhole_metrics_to_migrate_off_datadog: bool,
     ) {
         let mut last_updated = SystemTime::now();
         let mut buffer: Vec<u8> = vec![];
-        let mut last_error_log = SystemTime::now().checked_sub(Duration::from_secs(60)).unwrap();
+        let mut last_error_log = SystemTime::now()
+            .checked_sub(Duration::from_secs(60))
+            .unwrap();
 
         loop {
             match rx.recv() {
@@ -977,6 +1012,22 @@ mod batch_processor {
                     if buffer.len() >= batching_options.max_buffer_size
                         || last_updated + batching_options.max_time < current_time
                     {
+                        if !blackhole_metrics_to_migrate_off_datadog {
+                            send_to_socket_with_retries(
+                                &batching_options,
+                                &socket,
+                                &buffer,
+                                &to_addr,
+                                &socket_path,
+                                &mut last_error_log,
+                            );
+                        }
+                        buffer.clear();
+                        last_updated = current_time;
+                    }
+                }
+                Ok(Message::Shutdown) => {
+                    if !blackhole_metrics_to_migrate_off_datadog {
                         send_to_socket_with_retries(
                             &batching_options,
                             &socket,
@@ -985,19 +1036,7 @@ mod batch_processor {
                             &socket_path,
                             &mut last_error_log,
                         );
-                        buffer.clear();
-                        last_updated = current_time;
                     }
-                }
-                Ok(Message::Shutdown) => {
-                    send_to_socket_with_retries(
-                        &batching_options,
-                        &socket,
-                        &buffer,
-                        &to_addr,
-                        &socket_path,
-                        &mut last_error_log,
-                    );
                     buffer.clear();
                 }
                 Err(e) => {
